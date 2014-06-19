@@ -1,0 +1,206 @@
+#!/usr/bin/env escript
+-mode(compile).
+-author('Andrey Ivanov').
+
+% Main loop configuration
+-record(config, {
+  rows,       % Terminal size
+  colomns,    % Terminal size
+  rate        % Reqested generations per second
+}).
+
+-record(world, {
+  liveSet,   % Set of {Line, Colom} for live cells
+  neibhors,  % Dict {Line, Colom} => Number of neibhors (only for non zero cells)
+  generation % Generation number 1 based
+}).
+
+
+%% ===========================================
+%% Script entry point, argument parsing block
+%% ===========================================
+
+usage()->
+  io:format(
+    "Game of Life with infinite size field~n"
+    "Usage: life_game Rate FirstGenConfig~n"
+    "    Rate is desired game speed in generations per second~n"
+    "    FirstGenConfig - file with following format:~n"
+    "~n"
+    "000000XXX~n"
+    "000X000~n"
+    "~n"
+    "~n"
+    "Where X mean live cell, everything else - nol live cell, lines can~n"
+    "have different sizes, trailing not X chars and lines are ignored~n"
+  ),
+  halt().
+
+
+%% Script entry point
+main([RateString, FirstGenConfig]) ->
+  {Config, FirstGeneration} =
+    try
+      Rate = list_to_integer(RateString),
+      true = Rate > 0,
+      RateConfig = #config{rate = Rate},
+
+      % Detect if output is a terminal and it's size
+      TerminalConfig =
+      case {io:columns(), io:rows()} of
+        {{ok, Colomns}, {ok, Rows}} ->
+           RateConfig#config{colomns = Colomns, rows = Rows};
+         _ ->
+          % Not a terminal
+          throw({not_a_terminal, "Should run only on terminal"})
+      end,
+
+      % Read first generation from config file
+      FirstGeneration0 = readFirstGen(FirstGenConfig),
+
+      {TerminalConfig, FirstGeneration0}
+    catch
+      throw:{_, Message}  ->
+        io:format(Message ++ "~n"),
+        usage();
+      _:_ -> usage()
+    end,
+  enterLoop(Config, FirstGeneration);
+
+main(_) ->
+  usage().
+
+
+%% Read first generation config
+readFirstGen(FirstGenConfig) ->
+  File = openConfig(FirstGenConfig),
+  LiveCels = readLines(File, 0, sets:new()),
+  ok = file:close(File),
+  LiveCels.
+
+%% Open config file or format and throw an error
+openConfig(FileName) ->
+  case file:open(FileName, [read]) of
+    {ok, File} -> File;
+    {error, Reason} ->
+      throw({error_opening_config, io_lib:format("Filed to open FirstGenConfig file: ~p~n", [Reason])})
+  end.
+
+%% Recursivly read lines of FirstGenConfig file
+readLines(File, LineN, LiveCelsSet) ->
+  case file:read_line(File) of
+    eof ->
+      LiveCelsSet;
+    {erro, Reason} ->
+      io:format("Filed to read FirstGenConfig~n"),
+      throw({error_reading_config, Reason});
+    {ok, Cels} ->
+      NewLiveCelsSet = addConfigLine(LineN, Cels, LiveCelsSet),
+      readLines(File, LineN + 1, NewLiveCelsSet)
+  end.
+
+addConfigLine(LineN, CellsString, LiveCelsSet) ->
+  F = fun( $X , {Colom, Cells}) -> {Colom + 1, sets:add_element({LineN, Colom}, Cells)};
+         ( _ , {Colom, Cells}) -> {Colom + 1, Cells}
+    end,
+  element(2, lists:foldl(F, {0, LiveCelsSet}, CellsString)).
+
+
+%% =======================================================
+%% Field display block
+%% =======================================================
+
+draw( #config{rows = Rows, colomns = Colomns}, #world{liveSet = LiveCells, generation = Generation} ) ->
+  % Draw
+  clearScreen(),
+  % Header
+  io:format("Life game.  Generation : ~w~n", [Generation]),
+  % Draw live cells. Sets have no foreach.
+  sets:fold(
+    fun({Row, Colomn}, _) when Row > 0, Colomn > 0, Row < Rows - 1, Colomn < Colomns ->
+      % Got desired position and draw X
+      io:format("\e[~w;~wHX", [Row + 2, Colomn +1]),
+       true;
+       (_, _) -> true
+     end,
+     true,
+     LiveCells
+  ),
+  %Move cursor out
+  io:format("\e[~w;~wH", [Rows + 1, Colomns +1]).
+
+
+%% Send clear screen controll sequence to console
+clearScreen()->
+  io:format("\e[2J\e[1;1H").
+
+
+
+%% =======================================================
+%% Main loop block
+%% =======================================================
+
+% Set up loop env  (#config, set({Raw, Colomn}))
+enterLoop(Config, FirstGeneration) ->
+  loop(initializeWorld(FirstGeneration), Config).
+
+
+% Main loop (#world , #config)
+loop(World, Config) ->
+  draw(Config, World),
+  NewWorld = nextGeneration(World),
+  timer:sleep(1000 div Config#config.rate),
+  loop(NewWorld, Config).
+
+
+% Initialize world from live cels set
+initializeWorld(FirstGeneration) ->
+  NeibhorDict = sets:fold(fun addLife/2, dict:new(), FirstGeneration),
+  #world{liveSet = FirstGeneration, neibhors = NeibhorDict, generation = 1}.
+
+% Increment neibhor counters around new live cell
+addLife(Place, NeibhorDict) ->
+  Add = fun(Place0, Dict) ->
+    dict:update_counter(Place0, 1, Dict)
+  end,
+  lists:foldl(Add, NeibhorDict, neibhors(Place)).
+
+% Decrement counters and remove cells from dict when some cell dies
+removelife(Place, NeibhorDict) ->
+  Remove = fun(Place0, Dict) ->
+    case dict:find(Place0, Dict) of
+      error -> Dict;
+      {ok, 1} -> dict:erase(Place0, Dict);
+      {ok, _Value} -> dict:update_counter(Place0, -1, Dict)
+    end
+  end,
+  lists:foldl(Remove, NeibhorDict, neibhors(Place)).
+
+% Find neibhors affected by life in some cell
+neibhors({Line, Colom}) ->
+  Shifts =  [{X,Y} || X <- [-1,0,1], Y <- [-1,0,1] ] -- [{0,0}],
+  [{Line + X, Colom + Y} || {X,Y} <- Shifts].
+
+% Next generation
+nextGeneration(World = #world{liveSet = LiveSet, neibhors = NeibhorDict, generation = Generation}) ->
+  % Existing life dies
+  Die = fun(Place, W = #world{liveSet = LS, neibhors = ND}) ->
+    case dict:find(Place, NeibhorDict) of
+      {ok, Value} when Value == 2; Value == 3 -> W;
+      _ ->
+        #world{liveSet = sets:del_element(Place, LS), neibhors = removelife(Place, ND)}
+    end
+  end,
+  World1 = sets:fold(Die, World, LiveSet),
+
+  % New life begins
+  New = fun(Place, 3, W = #world{liveSet = LS, neibhors = ND})->
+              case sets:is_element(Place, LS) of
+                true -> W;
+                false -> #world{liveSet = sets:add_element(Place, LS), neibhors = addLife(Place, ND)}
+              end;
+           (_, _, W) ->
+              W
+  end,
+  World2 = dict:fold(New, World1, NeibhorDict),
+  World2#world{generation = Generation + 1}.
